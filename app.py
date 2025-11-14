@@ -16,7 +16,7 @@ load_dotenv()
 
 # Initialize Flask
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Firebase configuration from environment variables
 firebase_config = {
