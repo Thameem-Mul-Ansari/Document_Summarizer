@@ -1,278 +1,189 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from groq import Groq
+import requests
 import os
-import firebase_admin
-from firebase_admin import credentials, firestore, storage
-from openai import AzureOpenAI
-import chromadb
 from PyPDF2 import PdfReader
-from docx import Document
-from pptx import Presentation
-from dotenv import load_dotenv
+import docx
 import tempfile
+from dotenv import load_dotenv
 
-# Load .env
-load_dotenv()
+load_dotenv()  # Load environment variables from .env
 
-# Initialize Flask
 app = Flask(__name__)
-CORS(app, origins="*", supports_credentials=True)
+CORS(app)
 
-# Firebase configuration from environment variables
-firebase_config = {
-    "type": "service_account",
-    "project_id": os.getenv("FIREBASE_PROJECT_ID"),
-    "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-    "private_key": os.getenv("FIREBASE_PRIVATE_KEY").replace('\\n', '\n'),
-    "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-    "client_id": os.getenv("FIREBASE_CLIENT_ID"),
-    "auth_uri": os.getenv("FIREBASE_AUTH_URI"),
-    "token_uri": os.getenv("FIREBASE_TOKEN_URI"),
-    "auth_provider_x509_cert_url": os.getenv("FIREBASE_AUTH_PROVIDER_CERT_URL"),
-    "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL"),
-    "universe_domain": "googleapis.com"
-}
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Initialize Firebase Admin SDK from environment variables
-if not firebase_admin._apps:
-    cred = credentials.Certificate(firebase_config)
-    firebase_admin.initialize_app(cred, {
-        "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET")
-    })
-
-db = firestore.client()
-bucket = storage.bucket()
-
-# Initialize Azure OpenAI (model/deployment/version from .env)
-azure_client = AzureOpenAI(
-    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-    api_version=os.getenv("AZURE_OPENAI_VERSION"),
-    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
-)
-
-# Initialize Chroma Cloud
-chroma_client = chromadb.CloudClient(
-    tenant=os.getenv("CHROMA_TENANT"),
-    database=os.getenv("CHROMA_DATABASE"),
-    api_key=os.getenv("CHROMA_API_KEY")
-)
-collection = chroma_client.get_or_create_collection("documents")
-
-# --- Text Extraction ---
-def extract_text(file_path, ext):
-    if ext == "pdf":
-        reader = PdfReader(file_path)
-        return " ".join([page.extract_text() or "" for page in reader.pages])
-    elif ext == "docx":
-        doc = Document(file_path)
-        return "\n".join([p.text for p in doc.paragraphs])
-    elif ext == "pptx":
-        prs = Presentation(file_path)
-        text = ""
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    text += shape.text + "\n"
-        return text
-    return ""
-
-# --- Chunking ---
-def chunk_text(text, size=1000, overlap=200):
-    words = text.split()
-    return [" ".join(words[i:i+size]) for i in range(0, len(words), size - overlap)]
-
-# --- Summarize ---
-def summarize(text):
-    chunks = chunk_text(text, size=12000, overlap=0)
-    partial_summaries = []
-
-    # Step 1: Summarize each chunk separately
-    for i, chunk in enumerate(chunks):
-        prompt = f"Summarize the following portion of a document in detail (part {i+1}/{len(chunks)}):\n\n{chunk}"
-        resp = azure_client.chat.completions.create(
-            model=os.getenv("AZURE_DEPLOYMENT_NAME"),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=1000
-        )
-        part_summary = resp.choices[0].message.content.strip()
-        partial_summaries.append(part_summary)
-
-    # Step 2: Merge partial summaries into a cohesive summary
-    combined_summary_text = "\n\n".join(partial_summaries)
-    final_prompt = f"Combine the following section summaries into a cohesive, detailed overall summary of the entire document:\n\n{combined_summary_text}"
-
-    final_resp = azure_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": final_prompt}],
-        temperature=0,
-        max_tokens=1200
-    )
-
-    return final_resp.choices[0].message.content.strip()
-
-# --- Embed ---
-def embed(text):
-    resp = azure_client.embeddings.create(
-        input=[text],
-        model="text-embedding-ada-002"
-    )
-    return resp.data[0].embedding
-
-# --- Routes ---
-@app.route("/upload", methods=["POST"])
-def upload():
-    if "file" not in request.files:
-        return jsonify({"error": "No file"}), 400
-
-    file = request.files["file"]
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-
-    if not ext:
-        return jsonify({"error": "File must have an extension"}), 400
-
+def extract_text_from_pdf(url):
+    """Extract text from PDF file"""
     try:
-        # --- Save to temp ---
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
-            file.save(tmp.name)
-            text = extract_text(tmp.name, ext)
-
-        if not text.strip():
-            return jsonify({"error": "Could not extract text from file"}), 400
-
-        # --- Upload to Firebase Storage ---
-        blob = bucket.blob(f"docs/{file.filename}")
-        blob.upload_from_filename(tmp.name)
-        blob.make_public()
-        url = blob.public_url
-
-        # --- Summarize ---
-        summary = summarize(text)
-
-        # --- Create Firestore doc ---
-        doc_ref = db.collection("documents").add({
-            "name": file.filename,
-            "url": url,
-            "summary": summary,
-            "indexed": False,
-            "uploadedAt": firestore.SERVER_TIMESTAMP
-        })[1]
-
-        # --- Index in Chroma ---
-        for i, chunk in enumerate(chunk_text(text)):
-            emb = embed(chunk)
-            collection.add(
-                ids=[f"{doc_ref.id}_{i}"],
-                documents=[chunk],
-                metadatas=[{"doc_id": doc_ref.id, "chunk_id": i}],
-                embeddings=[emb]
-            )
-
-        # --- Mark as indexed ---
-        doc_ref.update({"indexed": True})
-
-        return jsonify({
-            "id": doc_ref.id,
-            "name": file.filename,
-            "url": url,
-            "summary": summary,
-            "indexed": True
-        })
-
+        response = requests.get(url)
+        response.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            temp_file.write(response.content)
+            temp_file_path = temp_file.name
+        text = ""
+        with open(temp_file_path, 'rb') as file:
+            pdf_reader = PdfReader(file)
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+        os.unlink(temp_file_path)
+        return text.strip()
     except Exception as e:
-        print("❌ Upload error:", e)
-        return jsonify({"error": str(e)}), 500
+        return f"Error extracting text from PDF: {str(e)}"
 
-    finally:
-        # Clean up temp file
-        try:
-            os.remove(tmp.name)
-        except Exception:
-            pass
+def extract_text_from_docx(url):
+    """Extract text from DOCX file"""
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as temp_file:
+            temp_file.write(response.content)
+            temp_file_path = temp_file.name
+        doc = docx.Document(temp_file_path)
+        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        os.unlink(temp_file_path)
+        return text.strip()
+    except Exception as e:
+        return f"Error extracting text from DOCX: {str(e)}"
 
-@app.route("/ask", methods=["POST"])
-def ask():
-    data = request.json
-    question = data.get("question")
-    doc_id = data.get("doc_id")
-    summary = data.get("summary")
+def extract_text_from_txt(url):
+    """Extract text from TXT file"""
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.text.strip()
+    except Exception as e:
+        return f"Error extracting text from TXT: {str(e)}"
 
-    if not all([question, doc_id, summary]):
-        return jsonify({"error": "Missing data"}), 400
+def extract_text_from_file(url, file_name):
+    """Extract text based on file type"""
+    if file_name.lower().endswith('.pdf'):
+        return extract_text_from_pdf(url)
+    elif file_name.lower().endswith('.docx'):
+        return extract_text_from_docx(url)
+    elif file_name.lower().endswith('.txt'):
+        return extract_text_from_txt(url)
+    else:
+        return f"Unsupported file type: {file_name}"
 
-    # Get embedding
-    q_emb = embed(question)
+def get_groq_response(messages, stream=False):
+    """Get response from Groq API"""
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.7,
+            max_completion_tokens=256,  # Short replies
+            top_p=1,
+            stream=stream,
+            stop=None
+        )
+        if stream:
+            response_text = ""
+            for chunk in completion:
+                if chunk.choices[0].delta.content:
+                    response_text += chunk.choices[0].delta.content
+            return response_text
+        else:
+            return completion.choices[0].message.content
+    except Exception as e:
+        return f"Error calling Groq API: {str(e)}"
 
-    # Query Chroma
-    results = collection.query(
-        query_embeddings=[q_emb],
-        n_results=4,
-        where={"doc_id": doc_id},
-        include=["documents"]
-    )
-    context = "\n\n".join(results["documents"][0])
+@app.route('/summary', methods=['POST'])
+def generate_summary():
+    """Generate concise summary for a document"""
+    try:
+        data = request.get_json()
+        file_url = data.get('file_url')
+        file_name = data.get('file_name')
+        if not file_url or not file_name:
+            return jsonify({'error': 'File URL and name are required'}), 400
+        extracted_text = extract_text_from_file(file_url, file_name)
+        if extracted_text.startswith("Error") or extracted_text.startswith("Unsupported"):
+            return jsonify({'error': extracted_text}), 400
+        if len(extracted_text) > 10000:
+            extracted_text = extracted_text[:10000] + "... [text truncated]"
+        summary_prompt = f"""
+Please provide a short, concise summary of the main points of this document in as few words as possible.
 
-    # RAG Prompt
-    prompt = f"Context:\n{context}\n\nSummary:\n{summary}\n\nQuestion:\n{question}\n\nAnswer clearly and concisely."
+Document: {file_name}
+Content:
+{extracted_text}
 
-    resp = azure_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=300
-    )
+Give only the essential information in 2-3 sentences.
+"""
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that provides ultra-concise summaries of documents."
+            },
+            {
+                "role": "user",
+                "content": summary_prompt
+            }
+        ]
+        summary = get_groq_response(messages)
+        return jsonify({
+            'summary': summary,
+            'file_name': file_name,
+            'status': 'success'
+        })
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
-    return jsonify({"answer": resp.choices[0].message.content})
+@app.route('/chat', methods=['POST'])
+def chat_with_document():
+    """Chat with document content (brief answers)"""
+    try:
+        data = request.get_json()
+        file_url = data.get('file_url')
+        file_name = data.get('file_name')
+        question = data.get('question')
+        if not file_url or not file_name or not question:
+            return jsonify({'error': 'File URL, name, and question are required'}), 400
+        extracted_text = extract_text_from_file(file_url, file_name)
+        if extracted_text.startswith("Error") or extracted_text.startswith("Unsupported"):
+            return jsonify({'error': extracted_text}), 400
+        if len(extracted_text) > 8000:
+            extracted_text = extracted_text[:8000] + "... [text truncated for processing]"
+        chat_prompt = f"""
+Based only on the content below, answer the user's question as briefly as possible (one or two sentences).
+If the answer isn't in the document, reply briefly that it can't be found.
 
-@app.route("/docs", methods=["GET"])
-def list_docs():
-    docs = []
-    for doc in db.collection("documents").stream():
-        data = doc.to_dict()
-        data["id"] = doc.id
-        docs.append(data)
-    return jsonify(docs)
+Document: {file_name}
+Content:
+{extracted_text}
 
-@app.route("/api/analyze-sentiment", methods=["POST"])
-def analyze_sentiment_batch():
-    data = request.get_json()
-    texts = data.get("texts", [])
-    if not texts:
-        return jsonify([]), 200
+User Question: {question}
 
-    results = []
-    for text in texts:
-        try:
-            prompt = f"""Analyze the sentiment of this message. Return ONLY valid JSON:
-{{
-  "score": <number from -1.0 to 1.0>,
-  "label": "positive" | "neutral" | "negative"
-}}
+Give a short, direct answer.
+"""
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that answers questions based only on document content. Be as brief and precise as possible."
+            },
+            {
+                "role": "user",
+                "content": chat_prompt
+            }
+        ]
+        response = get_groq_response(messages)
+        return jsonify({
+            'response': response,
+            'file_name': file_name,
+            'question': question,
+            'status': 'success'
+        })
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
-Message: "{text.strip()}"
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'message': 'Flask server is running'})
 
-Return only the JSON."""
-            response = azure_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0,
-                max_tokens=60
-            )
-
-            content = response.choices[0].message.content.strip()
-            json_str = content.replace("``````", "").strip()
-            parsed = eval(json_str)  # safe due to response_format
-            score = max(-1, min(1, float(parsed.get("score", 0))))
-            label = parsed.get("label", "neutral")
-            if label not in ["positive", "neutral", "negative"]:
-                label = "neutral"
-            results.append({"score": score, "label": label})
-        except Exception as e:
-            print(f"Sentiment error: {e}")
-            results.append({"score": 0, "label": "neutral"})
-
-    return jsonify(results)
-
-if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
