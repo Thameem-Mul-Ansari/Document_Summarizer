@@ -1,10 +1,10 @@
 flask
 flask-cors
 firebase-admin
-azure-openai
 chromadb
 PyPDF2
 python-docx
 python-pptx
 python-dotenv
 gunicorn
+langchain_openai
