@@ -8,3 +8,4 @@ python-pptx
 python-dotenv
 gunicorn
 langchain_openai
+groq
